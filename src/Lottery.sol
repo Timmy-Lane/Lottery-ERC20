@@ -9,17 +9,10 @@ import "@openzeppelin/contracts/utils/Strings.sol";
 import "@chainlink/contracts/src/v0.8/vrf/VRFConsumerBaseV2.sol";
 import "@chainlink/contracts/src/v0.8/vrf/interfaces/VRFCoordinatorV2Interface.sol";
 
-abstract contract Lottery is ERC721Enumerable, Ownable, ReentrancyGuard, VRFConsumerBaseV2{
-    using Strings for uint256;
-
+contract Lottery is Ownable, ReentrancyGuard, VRFConsumerBaseV2{
     uint256 public ticketPrice;
-
-    uint256 public roundId;
-    bool public roundOpen;
-
     uint256 public creatorFeeBase;
-    uint256 public platformFeeBase;
-    address public platformTreasury;
+    uint256 public currentRoundId;
 
     VRFCoordinatorV2Interface public coordinator;
     bytes32 public keyHash;
@@ -27,87 +20,87 @@ abstract contract Lottery is ERC721Enumerable, Ownable, ReentrancyGuard, VRFCons
     uint32 public callbackGasLimit = 250_000;
     uint16 public reqConfirmations = 3;
 
-    uint256 public lastRequestId;
     mapping(uint256 => uint256) public requestToRound;
 
-    struct RoundInfo{
-        uint256 startTokenId;
-        uint256 endTokenId;
+    struct Round{
         uint256 pot;
+        uint256 ticketsSold;
         address winner;
         uint256 randomWord;
-        bool settled;
-        uint256 ticketsSold;
-        uint256 timestamp;
+        RoundStatus status;
+        uint256 startedAt;
+        uint256 finishedAt;
     }
 
-    mapping(uint256 => RoundInfo) public rounds;
+    enum RoundStatus{
+        Open,
+        Awaiting,
+        Finished
+    }
 
-    event RoundStarted(uint256 indexed roundId, uint256 startTokenId);
-    event TicketsBought(address indexed buyer, uint256 indexed roundId, uint256 amount, uint256 paid);
+    mapping(uint256 => Round) public rounds;
+    mapping(uint256 => address[]) public ticketsByRound;
+
+    event RoundStarted(uint256 indexed roundId);
+    event TicketsBought(uint256 indexed roundId, address indexed player, uint256 amount, uint256 value);
     event RoundClosed(uint256 indexed roundId, uint256 requestId);
-    event WinnerSettled(uint256 indexed roundId, address indexed winner, uint256 prize, uint256 randomWord);
-    event FeesUpdated(uint256 creatorFeeBase, uint256 platformFeeBase);
-    event TicketPriceUpdated(uint256 ticketPrice);
+    event WinnerSelected(uint256 indexed roundId, address indexed winner, uint256 prize, uint256 houseFee, uint256 randomWord);
+    event TicketPriceUpdated(uint256 newPrice);
+    event HouseFeeUpdated(uint256 newFeeBps);
 
     error RoundNotOpen();
+    error NoTicketsInRound();
+    error RoundNotAwaitingVRF();
     error InvalidPayment();
-    error NoTickets();
-    error RoundAlreadySettled();
-    error NotVRFCoordinator();
 
     constructor(
-        string memory _name,
-        string memory _symbol,
         uint256 _ticketPrice,
         uint256 _creatorFeeBase,
-
         address _vrfCoordinator,
         bytes32 _keyHash,
         uint64 _subscriptionId
     )
-        ERC721(_name, _symbol)
+        Ownable(msg.sender)
         VRFConsumerBaseV2(_vrfCoordinator)
     {
-        ticketPrice = _ticketPrice;
-
         require(_creatorFeeBase <= 2000, "creator fee too high");
+        ticketPrice = _ticketPrice;
         creatorFeeBase = _creatorFeeBase;
 
         coordinator = VRFCoordinatorV2Interface(_vrfCoordinator);
         keyHash = _keyHash;
         subId = _subscriptionId;
+    }
 
+    function startRound() external onlyOwner{
         _startNewRound();
     }
 
-    function buyTickets(uint256 amount) external payable nonReentrant{
-        if(!roundOpen) revert RoundNotOpen();
-        if(amount == 0) revert NoTickets();
+    function buyTickets(uint256 ticketAmount) external payable nonReentrant{
+        if(ticketAmount == 0) revert NoTicketsInRound();
+        Round storage r = rounds[currentRoundId];
+        if(r.status != RoundStatus.Open) revert RoundNotOpen();
 
-        uint256 cost = ticketPrice * amount;
+        uint256 cost = ticketPrice * ticketAmount;
         if(msg.value != cost) revert InvalidPayment();
 
-        RoundInfo storage r = rounds[roundId];
-
-        for(uint256 i = 0; i < amount; i++){
-            uint256 tokenId = totalSupply() + 1;
-            _safeMint(msg.sender, tokenId);
+        address[] storage tickets = ticketsByRound[currentRoundId];
+        for(uint256 i = 0; i < ticketAmount; i++){
+            tickets.push(msg.sender);
         }
 
         r.pot += msg.value;
-        r.ticketsSold += amount;
+        r.ticketsSold += ticketAmount;
 
-        emit TicketsBought(msg.sender, roundId, amount, msg.value);
+        emit TicketsBought(currentRoundId, msg.sender, ticketAmount, msg.value);
     }
 
     function closeRound() external onlyOwner returns (uint256 requestId) {
-        RoundInfo storage r = rounds[roundId];
+        Round storage r = rounds[currentRoundId];
+        if (r.status != RoundStatus.Open) revert RoundNotOpen();
+        if (r.ticketsSold == 0) revert NoTicketsInRound();
 
-        require(roundOpen, "round already closed");
-        require(r.ticketsSold > 0, "no tickets sold");
-
-        roundOpen = false;
+        r.status = RoundStatus.Awaiting;
 
         requestId = coordinator.requestRandomWords(
             keyHash,
@@ -117,71 +110,53 @@ abstract contract Lottery is ERC721Enumerable, Ownable, ReentrancyGuard, VRFCons
             1
         );
 
-        lastRequestId = requestId;
-        requestToRound[requestId] = roundId;
+        requestToRound[requestId] = currentRoundId;
 
-        emit RoundClosed(roundId, requestId);
+        emit RoundClosed(currentRoundId, requestId);
     }
 
     function fulfillRandomWords(uint256 requestId, uint256[] memory randomWords) internal override {
-        uint256 rid = requestToRound[requestId];
-        RoundInfo storage r = rounds[rid];
-
-        if (r.settled) revert RoundAlreadySettled();
+        uint256 roundId = requestToRound[requestId];
+        Round storage r = rounds[roundId];
+        if (r.status != RoundStatus.Awaiting) revert RoundNotAwaitingVRF();
 
         uint256 randomWord = randomWords[0];
         r.randomWord = randomWord;
 
-        uint256 startId = r.startTokenId;
-        uint256 winnerOffset = randomWord % r.ticketsSold;
-        uint256 winnerTokenId = startId + winnerOffset;
-
-        address winner = ownerOf(winnerTokenId);
+        address[] storage tickets = ticketsByRound[roundId];
+        uint256 winnerIndex = randomWord % tickets.length;
+        address winner = tickets[winnerIndex];
         r.winner = winner;
-        r.settled = true;
-        r.endTokenId = startId + r.ticketsSold - 1;
-        r.timestamp = block.timestamp;
 
         uint256 pot = r.pot;
+        r.pot = 0;
+
         uint256 creatorFee = (pot * creatorFeeBase) / 10_000;
-        uint256 platformFee = (pot * platformFeeBase) / 10_000;
-        uint256 prize = pot - creatorFee - platformFee;
+        uint256 prize = pot - creatorFee;
 
-        if (platformFee > 0 && platformTreasury != address(0)) {
-            (bool okP, ) = platformTreasury.call{value: platformFee}("");
-            require(okP, "platform fee transfer failed");
+        r.status = RoundStatus.Finished;
+        r.finishedAt = block.timestamp;
+
+        if(creatorFee > 0){
+            (bool okFee, ) = owner().call{value:creatorFee}("");
+            require(okFee, 'creatorFee transfer failed');
         }
 
-        if (creatorFee > 0) {
-            (bool okC, ) = owner().call{value: creatorFee}("");
-            require(okC, "creator fee transfer failed");
-        }
+        (bool okWin, ) = winner.call{value: prize}("");
+        require(okWin, 'winner transfer failed');
 
-        (bool okW, ) = winner.call{value: prize}("");
-        require(okW, 'Winner transfer failed');
-
-        emit WinnerSettled(rid, winner, prize, randomWord);
+        emit WinnerSelected(roundId, winner, prize, creatorFee, randomWord);
         _startNewRound();
     }
 
     function _startNewRound() internal{
-        roundId += 1;
-        roundOpen = true;
+        currentRoundId += 1;
 
-        uint256 startTokenId = totalSupply() + 1;
+        Round storage r = rounds[currentRoundId];
+        r.status = RoundStatus.Open;
+        r.startedAt = block.timestamp;
 
-        rounds[roundId] = RoundInfo({
-            startTokenId: startTokenId,
-            endTokenId: 0,
-            pot: 0,
-            winner: address(0),
-            randomWord: 0,
-            settled: false,
-            ticketsSold: 0,
-            timestamp: block.timestamp
-        });
-
-        emit RoundStarted(roundId, startTokenId);
+        emit RoundStarted(currentRoundId);
     }
 
     function setTicketPrice(uint256 _ticketPrice) external onlyOwner {
@@ -189,9 +164,31 @@ abstract contract Lottery is ERC721Enumerable, Ownable, ReentrancyGuard, VRFCons
         emit TicketPriceUpdated(_ticketPrice);
     }
 
-    function pauseRound(bool open) external onlyOwner {
-        roundOpen = open;
+    function setCreatorFee(uint256 _creatorFeeBps) external onlyOwner {
+        require(_creatorFeeBps <= 2000, "house fee too high");
+        Round storage r = rounds[currentRoundId];
+        require(r.status == RoundStatus.Awaiting, 'Close Round before change creator fee');
+        creatorFeeBase = _creatorFeeBps;
+        emit HouseFeeUpdated(_creatorFeeBps);
     }
 
-    
+    function setVRFConfig(
+        bytes32 _keyHash,
+        uint64 _subscriptionId,
+        uint32 _callbackGasLimit,
+        uint16 _requestConfirmations
+    ) external onlyOwner {
+        keyHash            = _keyHash;
+        subId     = _subscriptionId;
+        callbackGasLimit   = _callbackGasLimit;
+        reqConfirmations = _requestConfirmations;
+    }
+
+    function getRoundTickets(uint256 roundId) external view returns (address[] memory) {
+        return ticketsByRound[roundId];
+    }
+
+    function currentRound() external view returns (Round memory) {
+        return rounds[currentRoundId];
+    }
 }
