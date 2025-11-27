@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/utils/Strings.sol";
 
 import "@chainlink/contracts/src/v0.8/vrf/VRFConsumerBaseV2.sol";
 import "@chainlink/contracts/src/v0.8/vrf/interfaces/VRFCoordinatorV2Interface.sol";
@@ -44,9 +42,9 @@ contract Lottery is Ownable, ReentrancyGuard, VRFConsumerBaseV2{
     event RoundStarted(uint256 indexed roundId);
     event TicketsBought(uint256 indexed roundId, address indexed player, uint256 amount, uint256 value);
     event RoundClosed(uint256 indexed roundId, uint256 requestId);
-    event WinnerSelected(uint256 indexed roundId, address indexed winner, uint256 prize, uint256 houseFee, uint256 randomWord);
+    event WinnerSelected(uint256 indexed roundId, address indexed winner, uint256 prize, uint256 creatorFee, uint256 randomWord);
     event TicketPriceUpdated(uint256 newPrice);
-    event HouseFeeUpdated(uint256 newFeeBps);
+    event HouseFeeUpdated(uint256 newFeeBase);
 
     error RoundNotOpen();
     error NoTicketsInRound();
@@ -70,9 +68,7 @@ contract Lottery is Ownable, ReentrancyGuard, VRFConsumerBaseV2{
         coordinator = VRFCoordinatorV2Interface(_vrfCoordinator);
         keyHash = _keyHash;
         subId = _subscriptionId;
-    }
 
-    function startRound() external onlyOwner{
         _startNewRound();
     }
 
