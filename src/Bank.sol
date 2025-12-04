@@ -1,43 +1,62 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.30;
 
-contract Bank {
-    uint8 public baseFee = 50;
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 
-    mapping(address => uint256) public userBalance;
+contract Bank is Ownable, ReentrancyGuard{
+    mapping(address => uint256) public balances;
+    address public gameManager;
+
+    modifier onlyGameManager(){
+        require(msg.sender == gameManager, "Not GM");
+        _;
+    }
 
     event Deposited(address indexed user, uint256 amount);
     event Withdrawn(address indexed user, uint256 amount);
-    event GameDebit(address indexed game, address indexed user, uint256 amount);
-    event GameCredit(address indexed game, address indexed user, uint256 amount);
-    event GameRegistered(address indexed game, bool allowed);
+    event Debited(address indexed player, uint256 amount);
+    event Credited(address indexed player, uint256 amount);
+    event GameManagerUpdated(address indexed gm);
 
-    function deposit() external payable{
+    function setGameManager(address gm) external onlyOwner{
+        require(gm != address(0), "0 address");
+        gameManager = gm;
+        emit GameManagerUpdated(gm);
+    }
+
+    function deposit() external payable nonReentrant{
         require(msg.value > 0, 'Zero deposit');
-        userBalance[msg.sender] += msg.value;
+        balances[msg.sender] += msg.value;
 
         emit Deposited(msg.sender, msg.value);
     }
 
-    function withdraw(uint256 amount) external{
+    function withdraw(uint256 amount) external nonReentrant{
         require(amount > 0, 'Zero withdraw');
-        require(userBalance[msg.sender] >= amount, 'Insufficient balance');
-         userBalance[msg.sender] -= amount;
+        require(balances[msg.sender] >= amount, 'Insufficient balance');
+        balances[msg.sender] -= amount;
         (bool success, ) = msg.sender.call{value: amount}("");
-        require(success, 'Transfer fail!');
+        require(success, 'Withdraw fail!');
 
         emit Withdrawn(msg.sender, amount);
     }
 
+    function debit(address player, uint256 amount) external onlyGameManager{
+        require(balances[player] >= amount, 'Insufficient balance');
+        balances[player] -= amount;
+        emit Debited(player, amount);
+    }
+
+    function credit(address player, uint256 amount) external onlyGameManager{
+        balances[player] += amount;
+        emit Credited(player, amount);
+    }
+
     function balanceOf(address player) external view returns(uint256){
-        return userBalance[player];
+        return balances[player];
     }
 
-    function transferToGame(address game, uint256 value) external{
-
-    }
-
-    function transferFromGame(address game, address player, uint256 value) external{
-
-    }
+    receive() external payable { revert("Use deposit()"); }
+    fallback() external payable { revert("Invalid call"); }
 }
